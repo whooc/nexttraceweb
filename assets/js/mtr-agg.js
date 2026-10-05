@@ -345,42 +345,71 @@
         return Math.sqrt(variance / values.length);
     }
 
-    function getRGB(latency) {
-        var result = { r: 0, g: 0, b: 0 };
-        if (isNaN(latency) || latency === 0) {
-            return result;
+    // Heatmap ramps tuned for the dark neutral surface (#0e1117).
+    // Each stop is [t, r, g, b] where t is a normalized 0..1 position.
+    var LATENCY_RAMP = [
+        [0, 15, 42, 34],
+        [0.35, 20, 58, 46],
+        [0.7, 62, 45, 22],
+        [1, 92, 38, 32]
+    ];
+    var STDEV_RAMP = [
+        [0, 16, 40, 34],
+        [0.4, 22, 55, 45],
+        [0.7, 60, 47, 24],
+        [1, 90, 38, 32]
+    ];
+    var LOSS_RAMP = [
+        [0, 22, 48, 40],
+        [0.35, 74, 58, 26],
+        [0.7, 118, 52, 34],
+        [1, 158, 46, 42]
+    ];
+
+    function sampleRamp(ramp, t) {
+        var clamped = t;
+        if (isNaN(clamped)) {
+            clamped = 0;
         }
-        var colorR = Math.round((latency - 180) / 2);
-        if (colorR < 0) colorR = 0;
-        if (colorR > 100) colorR = 100;
+        if (clamped < 0) clamped = 0;
+        if (clamped > 1) clamped = 1;
 
-        var colorG = Math.round(40 - 0.000005 * Math.pow(latency, 3));
-        if (colorG < 0) colorG = 0;
-        if (colorG > 40) colorG = 40;
+        var upperIndex = 1;
+        while (upperIndex < ramp.length - 1 && clamped > ramp[upperIndex][0]) {
+            upperIndex += 1;
+        }
+        var lower = ramp[upperIndex - 1];
+        var upper = ramp[upperIndex];
+        var span = upper[0] - lower[0];
+        var ratio = span === 0 ? 0 : (clamped - lower[0]) / span;
 
-        result.r = colorR;
-        result.g = colorG;
-        return result;
+        return {
+            r: Math.round(lower[1] + (upper[1] - lower[1]) * ratio),
+            g: Math.round(lower[2] + (upper[2] - lower[2]) * ratio),
+            b: Math.round(lower[3] + (upper[3] - lower[3]) * ratio)
+        };
+    }
+
+    function getRGB(latency) {
+        if (isNaN(latency) || latency === 0) {
+            return { r: 0, g: 0, b: 0 };
+        }
+        // 0 ms -> cool teal, 400 ms and beyond -> warm brick.
+        return sampleRamp(LATENCY_RAMP, latency / 400);
     }
 
     function getRGBstdev(stdev) {
-        var result = { r: 0, g: 0, b: 0 };
         if (isNaN(stdev) || stdev === 0) {
-            return result;
+            return { r: 0, g: 0, b: 0 };
         }
-        var colorR = Math.round((stdev - 5) * 4);
-        if (colorR < 0) colorR = 0;
-        if (colorR > 100) colorR = 100;
-
-        result.r = colorR;
-        return result;
+        // 0 ms -> neutral, 25 ms and beyond -> warm brick.
+        return sampleRamp(STDEV_RAMP, stdev / 25);
     }
 
     function getLossColor(loss) {
-        var colorLossR = Math.round(Math.pow(loss, 1.6) + 10);
-        if (colorLossR < 11) colorLossR = 0;
-        if (colorLossR > 160) colorLossR = 160;
-        return 'rgba(' + colorLossR + ',0,0,1)';
+        // 0% -> neutral, 100% -> saturated brick red.
+        var color = sampleRamp(LOSS_RAMP, loss / 100);
+        return 'rgba(' + color.r + ',' + color.g + ',' + color.b + ',1)';
     }
 
     return {

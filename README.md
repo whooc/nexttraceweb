@@ -38,6 +38,22 @@ NextTrace Web is a spin-off of the [NextTrace](https://github.com/nxtrace/NTrace
 
 ---
 
+## Interface Theme
+
+This fork restyles the frontend with a neutral dark theme. Only the presentation layer changed: `assets/css/m.css` and the heatmap color ramps in `assets/js/mtr-agg.js`. No DOM ids, i18n keys, English/Chinese copy, or table markup were touched, so the upstream test suite still passes unmodified.
+
+| | Upstream | This fork |
+|---|---|---|
+| Page background | `#030704` (dark green) | `#0e1117` (neutral dark blue-grey) |
+| Accent | `#4fdd73` (fluorescent green) | `#4d9ef7` (blue) |
+| Table header | green gradient bar | flat `#1a2230` |
+| Latency heatmap | pure red channel ramp | teal → amber → brick ramp |
+| Card treatment | translucent + blur + heavy shadow | solid surface + hairline border |
+
+The heatmap ramps are sampled continuously rather than clamped per-channel, so the gradient stays smooth across the whole latency range. Numeric columns are right-aligned with tabular figures, and a fixed light foreground color is applied to those cells so the inline background stays legible at every step of the ramp.
+
+---
+
 ## How To Use
 
 ### Docker (Recommended)
