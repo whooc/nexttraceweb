@@ -32,9 +32,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, make_response, redirect, render_template, request
 from flask_socketio import SocketIO
 
+import auth
+import login_i18n
 from nexttrace_mtr import INVALID_PARAM_PATTERN, build_mtr_raw_command, build_process_env, parse_mtr_raw_line
 
 
@@ -366,19 +368,57 @@ class TraceTask:
             pass
 
 
-app = Flask(__name__, static_folder="assets")
+# static_url_path must match the real folder name: the templates reference
+# assets/... relatively (see templates/index.html) and nginx.conf proxies
+# /assets/... through to this app, so serving them under the default /static/
+# prefix would 404 the stylesheets.
+app = Flask(__name__, static_folder="assets", static_url_path="/assets")
 app.config.update(
     SECRET_KEY=load_secret_key(),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=env_bool("NTWA_SESSION_COOKIE_SECURE", False),
+    PERMANENT_SESSION_LIFETIME=max(1, env_int("NTWA_SESSION_LIFETIME_SECONDS", 43200)),
     NTWA_NEXTTRACE_PATH=os.environ.get("NTWA_NEXTTRACE_PATH", "/usr/local/bin/nexttrace"),
     NTWA_TRUSTED_HOSTS=parse_trusted_hosts(os.environ.get("NTWA_TRUSTED_HOSTS")),
     NTWA_TRACE_IDLE_TIMEOUT_SECONDS=max(0.0, env_float("NTWA_TRACE_IDLE_TIMEOUT_SECONDS", 120.0)),
     NTWA_TRACE_MAX_DURATION_SECONDS=max(0.0, env_float("NTWA_TRACE_MAX_DURATION_SECONDS", 0.0)),
     NTWA_MAX_ACTIVE_TRACES=max(1, env_int("NTWA_MAX_ACTIVE_TRACES", 64)),
     NTWA_MIN_START_INTERVAL_SECONDS=max(0.0, env_float("NTWA_MIN_START_INTERVAL_SECONDS", 1.0)),
+    NTWA_MIN_LOGIN_INTERVAL_SECONDS=max(0.0, env_float("NTWA_MIN_LOGIN_INTERVAL_SECONDS", 0.5)),
+    NTWA_MAX_LOGIN_ATTEMPTS=max(0, env_int("NTWA_MAX_LOGIN_ATTEMPTS", 10)),
+    NTWA_HEALTHZ_PUBLIC=env_bool("NTWA_HEALTHZ_PUBLIC", False),
+    NTWA_LOGIN_ATTEMPTS={},
 )
+
+
+def load_auth_users() -> dict:
+    """Resolve the account table once at boot.
+
+    Failing hard here is intentional: a misconfigured account source must not
+    degrade into "no authentication".
+    """
+    try:
+        users = auth.load_users()
+    except auth.AuthConfigError as exc:
+        logging.error("Authentication configuration is invalid: %s", exc)
+        raise SystemExit(2) from exc
+
+    if users:
+        logging.info(
+            "Authentication enabled for %d account(s): %s",
+            len(users),
+            ", ".join(sorted(users)),
+        )
+    else:
+        logging.warning(
+            "Authentication is NOT configured (no NTWA_USERS / NTWA_USERS_FILE). "
+            "All protected routes will be refused. Set an account source to enable the app."
+        )
+    return users
+
+
+app.config["NTWA_USERS"] = load_auth_users()
 socketio = SocketIO(
     app,
     async_mode=SOCKETIO_ASYNC_MODE,
@@ -612,6 +652,88 @@ def validate_request_host():
     return None
 
 
+@app.before_request
+def enforce_authentication():
+    """Gate every route behind a session login when accounts are configured."""
+    return auth.require_auth_guard()
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    # Without accounts there is no way to ever satisfy this page, so say so
+    # plainly instead of bouncing the visitor between two routes.
+    if not auth.is_login_required():
+        return auth.locked_out_response()
+
+    if auth.current_username() is not None:
+        return redirect(auth.safe_redirect_target(request.args.get("next")) or "/")
+
+    locale = login_i18n.resolve_locale(
+        request.cookies.get(login_i18n.LOCALE_COOKIE),
+        request.accept_languages.to_header() if request.accept_languages else None,
+    )
+    translate = login_i18n.make_translator(locale)
+
+    error_key = None
+    username_value = ""
+    retry_after = 0
+    next_target = auth.safe_redirect_target(request.values.get("next"))
+
+    if request.method == "POST":
+        username_value = str(request.form.get("username", "")).strip()
+        password = request.form.get("password", "")
+
+        wait = auth.throttle_login()
+        if wait is not None:
+            error_key = "login.error.throttled"
+            retry_after = max(1, int(wait) + 1)
+        elif not username_value or not password:
+            error_key = "login.error.missing"
+        elif auth.verify_credentials(username_value, password):
+            auth.clear_login_attempts()
+            auth.login_user(username_value)
+            logging.info("Login succeeded user=%s ip=%s", username_value, request.remote_addr)
+            return redirect(next_target or "/")
+        else:
+            error_key = "login.error.invalid"
+            logging.warning("Login failed user=%r ip=%s", username_value, request.remote_addr)
+
+    response = make_response(
+        render_template(
+            "login.html",
+            t=translate,
+            locale=locale,
+            error_key=error_key,
+            username=username_value,
+            next_target=next_target,
+            retry_after=retry_after,
+        )
+    )
+    # Remember the resolved locale so the main UI's language selector can honour
+    # the same choice, and so repeat visits skip the header sniffing.
+    response.set_cookie(
+        login_i18n.LOCALE_COOKIE,
+        locale,
+        max_age=31536000,
+        httponly=False,
+        samesite="Lax",
+        secure=app.config["SESSION_COOKIE_SECURE"],
+    )
+    if error_key == "login.error.throttled":
+        response.status_code = 429
+        response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    username = auth.current_username()
+    auth.logout_user()
+    if username:
+        logging.info("Logout user=%s", username)
+    return redirect("/login")
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -648,7 +770,16 @@ def handle_connect():
     if not is_trusted_host(request.host):
         logging.warning("Rejected websocket from untrusted host=%s", request.host)
         return False
-    logging.info("Client connected sid=%s", request.sid)
+    # The HTTP gate does not cover Engine.IO upgrades, so re-check the session
+    # here. Without this a client could skip the login page and talk to the
+    # socket directly. Fails closed: an unconfigured server refuses sockets too.
+    if not auth.is_login_required():
+        logging.error("Rejected websocket: authentication is not configured")
+        return False
+    if auth.current_username() is None:
+        logging.warning("Rejected websocket from unauthenticated client ip=%s", request.remote_addr)
+        return False
+    logging.info("Client connected sid=%s user=%s", request.sid, auth.current_username())
     return None
 
 

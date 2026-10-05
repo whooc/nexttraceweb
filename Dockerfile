@@ -27,6 +27,8 @@ RUN python /tmp/download_nexttrace.py && \
 
 WORKDIR /app
 COPY app.py /app/app.py
+COPY auth.py /app/auth.py
+COPY login_i18n.py /app/login_i18n.py
 COPY nexttrace_mtr.py /app/nexttrace_mtr.py
 COPY templates /app/templates
 COPY assets /app/assets

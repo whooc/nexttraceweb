@@ -161,3 +161,7 @@ cython_debug/
 .idea/
 
 .preview/
+
+# Account maps for the built-in login page: treat as secrets, never commit.
+users.json
+ntwa-users.json

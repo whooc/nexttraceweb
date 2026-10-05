@@ -64,8 +64,20 @@ Path("/etc/nginx/nginx.conf").write_text(rendered)
 PY
 }
 
+warn_if_auth_missing() {
+    # The app fails closed: without an account source every protected route
+    # (including /healthz) is refused, which would make the container look
+    # permanently unhealthy. Say so loudly instead of letting it be a mystery.
+    if [[ -z "${NTWA_USERS:-}" && -z "${NTWA_USERS_FILE:-}" ]]; then
+        echo "WARNING: neither NTWA_USERS nor NTWA_USERS_FILE is set." >&2
+        echo "         Authentication is disabled and ALL routes will return 503." >&2
+        echo "         Generate accounts with:  docker exec <container> python /app/auth.py hash" >&2
+    fi
+}
+
 start_processes() {
     render_nginx_config
+    warn_if_auth_missing
 
     gunicorn \
         --bind "${APP_HOST}:${APP_PORT}" \

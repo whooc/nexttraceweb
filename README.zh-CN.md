@@ -47,7 +47,7 @@ docker run --network host -d --privileged --name ntwa tsosc/nexttraceweb [::1]:3
 # 监听[::1]:30080
 ```
 
-建议不要直接把服务裸露在公网，认证和访问控制请放在外层反代或网关上处理。
+**本 fork 内置了登录页，且在配置至少一个账号之前不会对外提供任何服务。** 详见下方[登录认证](#登录认证)——否则容器对所有路由都返回 `503 auth_not_configured`。
 
 ## 界面语言
 
@@ -88,21 +88,76 @@ location /tools/nexttrace/ {
 - 容器现在会在 `gunicorn` 或 `nginx` 任一核心进程退出时整体退出，便于外部 supervisor 正常拉起，而不是留下“容器还活着、服务已经死了”的假活状态。
 - `nexttrace_error` 现在是结构化载荷，至少包含 `code` 和 `message`；限流/容量拒绝还会带 `retry_after_seconds`。
 
-## 安全相关环境变量
+## 登录认证
 
-- `NTWA_SECRET_KEY`
-- `NTWA_TRUSTED_HOSTS`
-- `NTWA_SESSION_COOKIE_SECURE`
-- `NTWA_MIN_START_INTERVAL_SECONDS`
-- `NTWA_MAX_ACTIVE_TRACES`
-- `NTWA_TRACE_IDLE_TIMEOUT_SECONDS`
-- `NTWA_TRACE_MAX_DURATION_SECONDS`
+本 fork 增加了内置登录页。默认保护所有路由：页面本身、`/api/devices`、`/healthz`，静态资源除外；Socket.IO 握手会**独立再校验一次**会话，因为 HTTP 的 `before_request` 钩子覆盖不到 Engine.IO 的升级请求。
 
-生产环境请显式配置 `NTWA_SECRET_KEY`。如果不配置，应用会生成临时随机值并打印告警。
+> **失败即关闭（fail-closed）。** 没有配置任何账号时，应用会拒绝所有受保护路由并返回 `503` 与 `auth_not_configured` 正文，而不是悄悄放行匿名流量。升级后如果一路 503，说明你还没配账号——这是预期状态，不是 bug。
+
+### 1. 生成密码哈希
+
+密码以 PBKDF2-SHA256 哈希存储，账号表里出现明文会被直接拒绝启动。用自带的命令行工具生成，明文不用落到任何文件里：
+
+```bash
+# 本地仓库
+python auth.py hash '你的密码'
+
+# 容器内
+docker exec <容器名> python /app/auth.py hash '你的密码'
+```
+
+其他子命令：`python auth.py check <用户名>`（交互式校验密码）、`python auth.py users`（列出已配置账号）。
+
+### 2. 提供账号
+
+两个来源，按顺序查找：
+
+**`NTWA_USERS_FILE`** —— JSON 文件路径（挂载密钥文件，裸机部署更合适）：
+
+```json
+{
+  "alice": "pbkdf2:sha256:600000$03hLeQFFx28Rdv1G$462656e5...",
+  "bob": "pbkdf2:sha256:600000$Qn7Kd2mLx91Tsv4B$9b3f1a7c..."
+}
+```
+
+**`NTWA_USERS`** —— 同样的 JSON 内联，适合容器环境变量：
+
+```bash
+docker run --network host -d --privileged --name ntwa \
+  -e NTWA_SECRET_KEY="$(openssl rand -hex 32)" \
+  -e NTWA_USERS="{\"alice\":\"pbkdf2:sha256:600000\$03hLeQ...\"}" \
+  tsosc/nexttraceweb 127.0.0.1:30080
+```
+
+直接生成到环境变量里：
+
+```bash
+export NTWA_USERS="{\"alice\":\"$(python auth.py hash '你的密码')\"}"
+```
+
+账号表按密钥对待，不要提交进仓库；`.env` 与账号文件都已在 `.gitignore` 中。
+
+### 3. 相关配置项
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `NTWA_SECRET_KEY` | 每进程随机 | 会话签名密钥。**生产环境必须显式配置**——否则每次重启都会让所有会话失效，且多 worker 之间无法共享会话。 |
+| `NTWA_SESSION_LIFETIME_SECONDS` | `43200`（12 小时） | 登录态有效期。 |
+| `NTWA_MAX_LOGIN_ATTEMPTS` | `10` | 单 IP 在统计窗口内的失败次数上限，超过后锁定。 |
+| `NTWA_MIN_LOGIN_INTERVAL_SECONDS` | `0.5` | 两次尝试之间的最小间隔。 |
+| `NTWA_HEALTHZ_PUBLIC` | `false` | 设为 `true` 可让 `/healthz` 免登录访问——当编排系统的探针无法携带认证信息时需要。 |
+| `NTWA_SESSION_COOKIE_SECURE` | `false` | 只有外层代理终结 HTTPS 时才设为 `true`。 |
+
+`/logout`（GET 或 POST）会清除会话并跳回登录页。
+
+### 登录页语言
+
+登录页在服务端、任何 JavaScript 执行之前就确定了语言：先看 `ntwa_language` cookie，再看浏览器的 `Accept-Language`，最后回落到英文。登录成功会写入该 cookie，后续访问就跟随界面语言。这套机制与页面内那个客户端语言选择器相互独立。
 
 ## 外层鉴权示例
 
-下面是一个最小 Nginx Basic Auth 反代示例：
+内置登录页可以与外层网关**叠加使用**。下面是最小 Nginx Basic Auth 反代示例——注意此配置下容器仍需要自己的账号，实际是两层防护：
 
 ```nginx
 server {

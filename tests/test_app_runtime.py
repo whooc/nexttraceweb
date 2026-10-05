@@ -9,6 +9,10 @@ import unittest
 from unittest import mock
 
 import app as app_module
+import auth
+
+TEST_USERNAME = "runtime-user"
+TEST_PASSWORD = "runtime-secret"
 
 
 class FakePipe:
@@ -92,6 +96,7 @@ class AppRuntimeTests(unittest.TestCase):
             "NTWA_MAX_ACTIVE_TRACES": app_module.app.config["NTWA_MAX_ACTIVE_TRACES"],
             "NTWA_MIN_START_INTERVAL_SECONDS": app_module.app.config["NTWA_MIN_START_INTERVAL_SECONDS"],
             "NTWA_TRUSTED_HOSTS": app_module.app.config["NTWA_TRUSTED_HOSTS"],
+            "NTWA_USERS": app_module.app.config["NTWA_USERS"],
         }
         with app_module.clients_lock:
             app_module.clients.clear()
@@ -103,11 +108,22 @@ class AppRuntimeTests(unittest.TestCase):
             NTWA_MAX_ACTIVE_TRACES=64,
             NTWA_MIN_START_INTERVAL_SECONDS=0.0,
             NTWA_TRUSTED_HOSTS=(),
+            NTWA_USERS={TEST_USERNAME: auth.hash_password(TEST_PASSWORD)},
+            NTWA_MAX_LOGIN_ATTEMPTS=0,
+            NTWA_LOGIN_ATTEMPTS={},
         )
         self.flask_client = app_module.app.test_client()
+        self._login()
         self.socket_client = app_module.socketio.test_client(
             app_module.app, flask_test_client=self.flask_client
         )
+
+    def _login(self):
+        response = self.flask_client.post(
+            "/login",
+            data={"username": TEST_USERNAME, "password": TEST_PASSWORD},
+        )
+        self.assertEqual(response.status_code, 302)
 
     def tearDown(self):
         if self.socket_client.is_connected():

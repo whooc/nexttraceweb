@@ -64,7 +64,9 @@ docker run --network host -d --privileged --name ntwa tsosc/nexttraceweb 127.0.0
 # Visit http://127.0.0.1:30080
 ```
 
-Expose the service to the Internet through your own reverse proxy or gateway. This project does not ship an in-app login flow.
+Expose the service to the Internet through your own reverse proxy or gateway.
+
+**This fork ships a built-in login page and refuses to serve anything until you configure at least one account.** See [Authentication](#authentication) below — the container will otherwise return `503 auth_not_configured` for every route.
 
 ### Custom Address & Port
 
@@ -122,6 +124,7 @@ Both trailing slashes matter. Drop the one on `proxy_pass` and the backend recei
 
 ## Security Defaults
 
+- **Configure at least one account** (`NTWA_USERS` / `NTWA_USERS_FILE`). Until then the app is locked and serves `503`. See [Authentication](#authentication).
 - Configure `NTWA_SECRET_KEY` in production. If omitted, the app generates a temporary random key and logs a warning.
 - Recommended: set `NTWA_TRUSTED_HOSTS=trace.example.com` behind a reverse proxy.
 - Set `NTWA_SESSION_COOKIE_SECURE=true` only when the outer proxy serves HTTPS.
@@ -131,9 +134,76 @@ Both trailing slashes matter. Drop the one on `proxy_pass` and the backend recei
   - `NTWA_TRACE_IDLE_TIMEOUT_SECONDS`
   - `NTWA_TRACE_MAX_DURATION_SECONDS`
 
+## Authentication
+
+This fork adds a built-in login page. Every route is protected by default — the page itself, `/api/devices`, `/healthz`, static assets only excepted, and the Socket.IO handshake (which re-checks the session independently, because the HTTP `before_request` hook does not cover Engine.IO upgrades).
+
+> **Fail-closed by design.** With no accounts configured, the app refuses every protected route with `503` and an `auth_not_configured` body rather than quietly serving anonymous traffic. If you upgrade and see 503s, you have not configured an account yet — that is the intended state, not a bug.
+
+### 1. Generate password hashes
+
+Passwords are stored as PBKDF2-SHA256 hashes; the app refuses to start with a plaintext value in the account map. Use the bundled CLI so the plaintext is never written down:
+
+```bash
+# Local checkout
+python auth.py hash 'your-password'
+
+# Inside the container
+docker exec <container> python /app/auth.py hash 'your-password'
+```
+
+Other subcommands: `python auth.py check <user>` (prompts for a password and verifies it), `python auth.py users` (lists configured accounts).
+
+### 2. Provide the accounts
+
+Two sources, checked in this order:
+
+**`NTWA_USERS_FILE`** — path to a JSON file (mounted secret, better for bare-metal):
+
+```json
+{
+  "alice": "pbkdf2:sha256:600000$03hLeQFFx28Rdv1G$462656e5...",
+  "bob": "pbkdf2:sha256:600000$Qn7Kd2mLx91Tsv4B$9b3f1a7c..."
+}
+```
+
+**`NTWA_USERS`** — the same JSON inline, convenient for container env vars:
+
+```bash
+docker run --network host -d --privileged --name ntwa \
+  -e NTWA_SECRET_KEY="$(openssl rand -hex 32)" \
+  -e NTWA_USERS="{\"alice\":\"pbkdf2:sha256:600000\$03hLeQ...\"}" \
+  tsosc/nexttraceweb 127.0.0.1:30080
+```
+
+Generate accounts straight into your shell environment:
+
+```bash
+export NTWA_USERS="{\"alice\":\"$(python auth.py hash 'your-password')\"}"
+```
+
+Treat the account map as a secret. Do not commit it; `docker/` and `.env` files are gitignored for this reason.
+
+### 3. Related settings
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NTWA_SECRET_KEY` | random per process | Session signing key. **Set it in production** — otherwise every restart invalidates all sessions and multiple workers cannot share sessions. |
+| `NTWA_SESSION_LIFETIME_SECONDS` | `43200` (12h) | How long a login stays valid. |
+| `NTWA_MAX_LOGIN_ATTEMPTS` | `10` | Failed attempts per IP per window before lockout. |
+| `NTWA_MIN_LOGIN_INTERVAL_SECONDS` | `0.5` | Minimum delay between attempts. |
+| `NTWA_HEALTHZ_PUBLIC` | `false` | Set `true` to leave `/healthz` reachable without logging in — needed if your orchestrator cannot authenticate its probes. |
+| `NTWA_SESSION_COOKIE_SECURE` | `false` | Set `true` only when the outer proxy terminates HTTPS. |
+
+`/logout` (GET or POST) clears the session and returns you to the login page.
+
+### Login page language
+
+The login page resolves its language server-side, before any JavaScript runs: the `ntwa_language` cookie first, then the browser's `Accept-Language`, then English. Signing in sets the cookie so the page language follows the UI on subsequent visits. This is a separate mechanism from the in-app language selector, which is client-side.
+
 ## External Auth Example
 
-Minimal Nginx example with Basic Auth in front of the container:
+The built-in login page is optional to use *alongside* an outer gate. Minimal Nginx example with Basic Auth in front of the container — note that in this configuration the container still requires its own account, so you get two layers:
 
 ```nginx
 server {
